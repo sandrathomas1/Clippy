@@ -89,6 +89,7 @@ app_include_js = "/assets/clipy/js/floating_icon.js"
 
 # before_install = "clipy.install.before_install"
 # after_install = "clipy.install.after_install"
+after_migrate = "clipy.setup_assistant.setup"
 
 # Uninstallation
 # ------------

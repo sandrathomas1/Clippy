@@ -10,6 +10,9 @@
 
     /* Flag to prevent duplicate initialisation */
     var _agChatInitialised = false;
+    var _agentName = null;
+    var _conversationId = null;
+    var _isFetchingAgent = false;
 
     /**
      * Build the complete widget HTML and inject it into the page.
@@ -46,7 +49,7 @@
 
             /* Body */
             '<div class="ag-chat-body">' +
-                '<p>Hi, how can I help today?</p>' +
+                '<div class="ag-chat-msg-agent">Hi, how can I help today?</div>' +
             '</div>' +
 
             /* Footer / Input area */
@@ -88,6 +91,48 @@
         var els = buildWidget();
         _agChatInitialised = true;
 
+        /* Fetch the agent name and conversation in background */
+        if (typeof frappe !== "undefined" && frappe.db) {
+            _isFetchingAgent = true;
+            frappe.db.get_single_value("Clipy Settings", "default_agent")
+                .then(function(val) {
+                    _agentName = val;
+                    if (_agentName) {
+                        return frappe.call({
+                            method: "clipy.api.get_or_create_conversation",
+                            args: { agent_name: _agentName }
+                        });
+                    }
+                })
+                .then(function(r) {
+                    if (r && r.message) {
+                        _conversationId = r.message;
+                        setupRealtimeListener();
+                    }
+                })
+                .finally(function() {
+                    _isFetchingAgent = false;
+                });
+        }
+
+        function setupRealtimeListener() {
+            if (!_conversationId || !frappe.realtime) return;
+
+            // Remove existing listener to avoid duplicates if re-initialized
+            frappe.realtime.off('conversation:' + _conversationId);
+
+            frappe.realtime.on('conversation:' + _conversationId, function(data) {
+                if (data && data.type === 'frontend_tool_call_initiated') {
+                    if (data.function_name === 'redirect_to_page') {
+                        var route = data.tool_params.route;
+                        if (route) {
+                            frappe.set_route(route);
+                        }
+                    }
+                }
+            });
+        }
+
         /* -- Open chat -- */
         els.toggle.addEventListener("click", function () {
             els.widget.classList.add("ag-chat-widget--open");
@@ -101,18 +146,111 @@
             els.toggle.classList.remove("ag-chat-toggle--hidden");
         });
 
-        /* -- Send message (example handler) -- */
+        /* -- Send message handler -- */
         function handleSend() {
             var text = els.input.value.trim();
             if (!text) return;
 
-            var msg = document.createElement("p");
-            msg.className = "ag-chat-msg-user";
-            msg.textContent = text;
-            els.body.appendChild(msg);
-            els.body.scrollTop = els.body.scrollHeight;
+            appendMessage(text, 'user');
             els.input.value = "";
             els.input.focus();
+
+            if (typeof frappe === "undefined") {
+                appendMessage("Frappe object not found. Cannot connect to Agent.", 'agent');
+                return;
+            }
+
+            if (_isFetchingAgent) {
+                setTimeout(handleSend, 500); // Wait briefly
+                return;
+            }
+
+            if (!_agentName) {
+                appendMessage("No Default Agent configured in Clipy Settings.", 'agent');
+                return;
+            }
+
+            var typingIndicator = showTypingIndicator(els.body);
+
+            frappe.call({
+                method: "huf.ai.chat_api.run_agent_sync_chat",
+                args: {
+                    agent_name: _agentName,
+                    prompt: text,
+                    create_new: !_conversationId,
+                    conversation_id: _conversationId
+                },
+                callback: function(r) {
+                    removeTypingIndicator(typingIndicator);
+                    if (r.message) {
+                        var run_result = r.message;
+                        if (run_result.conversation_id) {
+                            _conversationId = run_result.conversation_id;
+                        }
+
+                        /* Process client-side tool calls directly from API response
+                           This bypasses the need for Socket.IO events to reach the frontend */
+                        if (run_result.client_side_tool_calls && run_result.client_side_tool_calls.length > 0) {
+                            var tools = run_result.client_side_tool_calls;
+                            for (var i = 0; i < tools.length; i++) {
+                                var call = tools[i];
+                                if (call.function && call.function.name === 'redirect_to_page') {
+                                    try {
+                                        var args = typeof call.function.arguments === 'string'
+                                            ? JSON.parse(call.function.arguments)
+                                            : call.function.arguments;
+
+                                        if (args && args.route) {
+                                            frappe.set_route(args.route);
+                                        }
+                                    } catch (err) {
+                                        console.error("Error parsing redirect_to_page arguments:", err);
+                                    }
+                                }
+                            }
+                        }
+
+                        var agentText = run_result.response || run_result.result || "No response";
+                        var formattedText = typeof frappe.markdown === "function" ? frappe.markdown(agentText) : agentText;
+                        appendMessage(formattedText, 'agent', true);
+                    } else if (r.exc) {
+                         appendMessage("An error occurred.", 'agent');
+                    }
+                },
+                error: function(r) {
+                    removeTypingIndicator(typingIndicator);
+                    appendMessage("Failed to connect to agent.", 'agent');
+                }
+            });
+        }
+
+        function appendMessage(text, role, isHtml) {
+            var msgContainer = document.createElement("div");
+            msgContainer.className = role === 'user' ? "ag-chat-msg-user" : "ag-chat-msg-agent";
+
+            if (isHtml) {
+                msgContainer.innerHTML = text;
+            } else {
+                msgContainer.textContent = text;
+            }
+
+            els.body.appendChild(msgContainer);
+            els.body.scrollTop = els.body.scrollHeight;
+        }
+
+        function showTypingIndicator(body) {
+            var indicator = document.createElement("div");
+            indicator.className = "ag-chat-typing";
+            indicator.innerHTML = '<div class="ag-chat-typing-dot"></div><div class="ag-chat-typing-dot"></div><div class="ag-chat-typing-dot"></div>';
+            body.appendChild(indicator);
+            body.scrollTop = body.scrollHeight;
+            return indicator;
+        }
+
+        function removeTypingIndicator(indicator) {
+            if (indicator && indicator.parentNode) {
+                indicator.parentNode.removeChild(indicator);
+            }
         }
 
         els.sendBtn.addEventListener("click", handleSend);
